@@ -24,22 +24,29 @@ public class VectorService {
 
     public double[] getVector(Article article) {
         try {
-            Map<String, String> request = new HashMap<>();
-            request.put("title", article.getTitle());
-            request.put("abstract", article.getArticleAbstract());
+            // Title ve abstract'ı birleştir
+            String combinedText = article.getTitle() + " " +
+                    (article.getArticleAbstract() != null ? article.getArticleAbstract() : "");
 
-            ResponseEntity<Map> response = restTemplate.postForEntity(
-                    VECTOR_SERVICE_URL,
-                    request,
-                    Map.class
+            // Request body
+            Map<String, String> requestBody = new HashMap<>();
+            requestBody.put("text", combinedText);
+
+            log.info("Sending text to vectorize: {}", combinedText.substring(0, Math.min(100, combinedText.length())));
+
+            // HTTP isteği
+            ResponseEntity<double[]> response = restTemplate.postForEntity(
+                    "http://localhost:8000/vectorize",
+                    requestBody,
+                    double[].class
             );
 
-            List<Double> vectorList = (List<Double>) response.getBody().get("vector");
-            return vectorList.stream().mapToDouble(Double::doubleValue).toArray();
+            log.info("Vector generated for article: {}", article.getTitle());
+            return response.getBody();
 
         } catch (Exception e) {
             log.error("Error getting vector for article: " + article.getTitle(), e);
-            throw new RuntimeException("Vector service error", e);
+            throw new RuntimeException("Error getting vector", e);
         }
     }
 }

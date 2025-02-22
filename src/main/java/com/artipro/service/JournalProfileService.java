@@ -4,6 +4,10 @@ import com.artipro.model.JournalInfo;
 import com.artipro.model.JournalMatch;
 import com.artipro.model.JournalProfile;
 import com.artipro.model.entity.Article;
+import com.artipro.model.entity.JournalArticleEntity;
+import com.artipro.model.entity.JournalProfileEntity;
+import com.artipro.repository.JournalArticleRepository;
+import com.artipro.repository.JournalProfileRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -13,8 +17,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.net.URLEncoder;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -23,8 +29,9 @@ import java.util.stream.Collectors;
 public class JournalProfileService {
     private final String BASE_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/";
     private final RestTemplate restTemplate;
-
     private final VectorService vectorService;
+    private final JournalProfileRepository profileRepository;
+    private final JournalArticleRepository articleRepository;
 
     private final List<JournalInfo> targetJournals = Arrays.asList(
             new JournalInfo("The Lancet", "0140-6736"),
@@ -35,10 +42,14 @@ public class JournalProfileService {
     );
 
     @Autowired
-    public JournalProfileService(RestTemplate restTemplate, VectorService vectorService) {
+    public JournalProfileService(RestTemplate restTemplate, VectorService vectorService,
+                                 JournalProfileRepository profileRepository, JournalArticleRepository articleRepository) {
         this.restTemplate = restTemplate;
         this.vectorService = vectorService;
+        this.profileRepository = profileRepository;
+        this.articleRepository = articleRepository;
     }
+
 
     public List<JournalProfile> collectJournalProfiles() {
         List<JournalProfile> profiles = new ArrayList<>();
@@ -46,81 +57,180 @@ public class JournalProfileService {
 
         for (JournalInfo journal : targetJournals) {
             try {
+                // Model oluştur
                 JournalProfile profile = buildJournalProfile(journal);
                 profiles.add(profile);
+
+                // Dergi entity'sini oluştur ve kaydet
+                JournalProfileEntity journalProfileEntity = new JournalProfileEntity();
+                journalProfileEntity.setJournalName(profile.getName());
+                journalProfileEntity.setIssn(profile.getIssn());
+                journalProfileEntity.setLastUpdated(LocalDateTime.now());
+
+                // Dergiyi kaydet ve kaydedilen entity'yi al
+                JournalProfileEntity savedProfile = profileRepository.save(journalProfileEntity);
+                log.info("Saved journal profile: {}", savedProfile.getJournalName());
+
+                // Makaleleri kaydet ve vektörize et
+                List<JournalArticleEntity> articles = new ArrayList<>();
+                for (Article article : profile.getRecentArticles()) {
+                    JournalArticleEntity articleEntity = new JournalArticleEntity();
+                    articleEntity.setTitle(article.getTitle());
+                    articleEntity.setArticleAbstract(article.getArticleAbstract());
+                    articleEntity.setPmid(article.getPmcId());
+                    //articleEntity.setPublishedDate(article.getPublicationDate());
+                    articleEntity.setJournal(savedProfile);
+
+                    // Makaleyi vektörize et
+                    try {
+                        double[] vector = vectorService.getVector(article);
+                        articleEntity.setVector(vector);
+                        log.info("Vector generated for article: {}", article.getTitle());
+                    } catch (Exception e) {
+                        log.error("Error generating vector for article: {}", article.getTitle(), e);
+                    }
+
+                    articles.add(articleEntity);
+                }
+
+                // Tüm makaleleri toplu kaydet
+                articleRepository.saveAll(articles);
+                log.info("Saved {} articles with vectors for journal: {}",
+                        articles.size(), savedProfile.getJournalName());
+
             } catch (Exception e) {
                 log.error("Error collecting profile for journal: " + journal.getName(), e);
             }
         }
 
-        log.info("Found {} profiles", profiles.size());
         return profiles;
     }
 
     public List<JournalMatch> findMatchingJournals(double[] articleVector) {
         List<JournalMatch> matches = new ArrayList<>();
-        List<JournalProfile> profiles = collectJournalProfiles();
+        List<JournalProfileEntity> journals = profileRepository.findAll();
 
-        for (JournalProfile profile : profiles) {
+        log.info("Found {} journals in database", journals.size());
+        log.info("Input article vector size: {}", articleVector.length);
+
+        for (JournalProfileEntity journal : journals) {
             try {
-                // Her dergi için son makalelerin vektörlerinin ortalamasını al
-                double[] journalVector = calculateJournalVector(profile);
-                log.info("Calculated vector for journal: {}", profile.getName());
-                // Benzerlik skorunu hesapla
+                Long journalId = journal.getId();
+                log.info("Querying articles for journal ID: {}", journalId);
+                List<JournalArticleEntity> articles = articleRepository.findArticlesByJournalId(journalId);
+                log.info("Journal: {}, Found {} articles", journal.getJournalName(), articles.size());
+
+                if (articles.isEmpty()) {
+                    log.warn("No articles found for journal: {}", journal.getJournalName());
+                    continue;
+                }
+
+                // Vektör null kontrolü
+                articles = articles.stream()
+                        .filter(a -> a.getVector() != null)
+                        .collect(Collectors.toList());
+
+                if (articles.isEmpty()) {
+                    log.warn("No articles with vectors found for journal: {}", journal.getJournalName());
+                    continue;
+                }
+
+                log.info("Processing {} articles with vectors for journal: {}",
+                        articles.size(), journal.getJournalName());
+
+                // Her makalenin vektör boyutunu kontrol et
+                articles.forEach(article ->
+                        log.info("Article: {}, Vector size: {}",
+                                article.getTitle(),
+                                article.getVector() != null ? article.getVector().length : "null")
+                );
+
+                double[] journalVector = calculateJournalVector(articles);
                 double similarity = calculateCosineSimilarity(articleVector, journalVector);
-                log.info("Similarity with {}: {}", profile.getName(), similarity);
+
                 matches.add(new JournalMatch(
-                        profile.getName(),
+                        journal.getJournalName(),
                         similarity,
-                        profile.getIssn()
+                        journal.getIssn()
                 ));
+
             } catch (Exception e) {
-                log.error("Error calculating similarity for journal: " + profile.getName(), e);
+                log.error("Error calculating similarity for journal: " + journal.getJournalName(), e);
+                log.error("Exception details: ", e);  // Stack trace'i göster
             }
         }
 
-        // Benzerlik skoruna göre sırala (en yüksekten düşüğe)
-        matches.sort((a, b) -> Double.compare(b.getSimilarity(), a.getSimilarity()));
-
-        // En iyi 3 eşleşmeyi döndür
-        return matches.stream().limit(3).collect(Collectors.toList());
+        return matches.stream()
+                .sorted(Comparator.comparing(JournalMatch::getSimilarity).reversed())
+                .collect(Collectors.toList());
     }
 
-    private double[] calculateJournalVector(JournalProfile profile) {
-        // Dergi profilindeki makalelerin vektörlerini hesapla
-        List<double[]> articleVectors = profile.getRecentArticles().stream()
-                .map(vectorService::getVector)
-                .collect(Collectors.toList());
+    private double[] calculateJournalVector(List<JournalArticleEntity> articles) {
+        try {
+            // İlk vektörün boyutunu al
+            int vectorSize = articles.get(0).getVector().length;
+            log.info("Vector size for calculation: {}", vectorSize);
 
-        // Vektörlerin ortalamasını al
-        int vectorSize = articleVectors.get(0).length;
-        double[] meanVector = new double[vectorSize];
+            double[] meanVector = new double[vectorSize];
+            int validVectorCount = 0;
 
-        for (double[] vector : articleVectors) {
-            for (int i = 0; i < vectorSize; i++) {
-                meanVector[i] += vector[i];
+            for (JournalArticleEntity article : articles) {
+                if (article.getVector() != null) {
+                    double[] vector = article.getVector();
+                    for (int i = 0; i < vectorSize; i++) {
+                        meanVector[i] += vector[i];
+                    }
+                    validVectorCount++;
+                    log.info("Added vector from article: {}", article.getTitle());
+                }
             }
-        }
 
-        for (int i = 0; i < vectorSize; i++) {
-            meanVector[i] /= articleVectors.size();
+            // Ortalama al
+            if (validVectorCount > 0) {
+                for (int i = 0; i < vectorSize; i++) {
+                    meanVector[i] /= validVectorCount;
+                }
+                log.info("Calculated mean vector from {} articles", validVectorCount);
+                return meanVector;
+            } else {
+                throw new RuntimeException("No valid vectors found in articles");
+            }
+        } catch (Exception e) {
+            log.error("Error in calculateJournalVector: {}", e.getMessage());
+            throw e;
         }
-
-        return meanVector;
     }
 
     private double calculateCosineSimilarity(double[] vectorA, double[] vectorB) {
-        double dotProduct = 0.0;
-        double normA = 0.0;
-        double normB = 0.0;
+        try {
+            if (vectorA.length != vectorB.length) {
+                log.error("Vector dimensions don't match: A={}, B={}", vectorA.length, vectorB.length);
+                throw new IllegalArgumentException("Vector dimensions must match");
+            }
 
-        for (int i = 0; i < vectorA.length; i++) {
-            dotProduct += vectorA[i] * vectorB[i];
-            normA += Math.pow(vectorA[i], 2);
-            normB += Math.pow(vectorB[i], 2);
+            double dotProduct = 0.0;
+            double normA = 0.0;
+            double normB = 0.0;
+
+            for (int i = 0; i < vectorA.length; i++) {
+                dotProduct += vectorA[i] * vectorB[i];
+                normA += vectorA[i] * vectorA[i];
+                normB += vectorB[i] * vectorB[i];
+            }
+
+            if (normA == 0 || normB == 0) {
+                log.warn("Zero magnitude vector detected");
+                return 0.0;
+            }
+
+            double similarity = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+            log.info("Calculated similarity: {}", similarity);
+            return similarity;
+
+        } catch (Exception e) {
+            log.error("Error in calculateCosineSimilarity: {}", e.getMessage());
+            throw e;
         }
-
-        return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
     private JournalProfile buildJournalProfile(JournalInfo journalInfo) {

@@ -1,6 +1,7 @@
 package com.artipro.model;
 
 import com.artipro.model.entity.Article;
+import com.artipro.model.entity.JournalProfileEntity;
 import lombok.Data;
 
 import java.util.List;
@@ -13,5 +14,6 @@ public class JournalProfile {
     private String scope;
     private String impactFactor;
     private List<String> commonKeywords;
+
     // diğer özellikler...
 }

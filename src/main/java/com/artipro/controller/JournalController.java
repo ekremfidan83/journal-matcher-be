@@ -53,9 +53,4 @@ public class JournalController {
             return ResponseEntity.internalServerError().build();
         }
     }
-
-    @GetMapping("/test")
-    public ResponseEntity<String> testEndpoint() {
-        return ResponseEntity.ok("Journal API is working!");
-    }
 }
